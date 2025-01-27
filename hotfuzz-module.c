@@ -30,10 +30,39 @@ long get_max_workers() {
 #define MAX_NEEDLE_LEN 128
 #define MAX_HAYSTACK_LEN 512
 #define BATCH_SIZE 2048
+#define MAX_WORDS 32
 
 int plugin_is_GPL_compatible;
 
 struct Str { char *b; size_t len; };
+
+static int ascii_isspace(char c) {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r';
+}
+
+struct Words {
+	struct Str a[MAX_WORDS];
+	size_t count;
+};
+
+static struct Words strsplitwords(struct Str s) {
+	struct Words words = { 0 };
+	size_t i = 0;
+
+	while (i < s.len && words.count < MAX_WORDS) {
+		while (i < s.len && ascii_isspace(s.b[i])) ++i;
+		const size_t word_start = i;
+		while (i < s.len && !ascii_isspace(s.b[i])) ++i;
+		if (i > word_start) {
+			words.a[words.count].b = s.b + word_start;
+			words.a[words.count].len = i - word_start;
+			s.b[i++] = '\0';
+			++words.count;
+		}
+	}
+
+	return words;
+}
 
 static char toupper_utf8(char c) {
 	return *u8"a" <= c && c <= *u8"z" ? c - (*u8"a" - *u8"A") : c;
@@ -179,14 +208,14 @@ struct Batch {
 
 struct Shared {
 	const bool ignore_case;
-	const struct Str needle;
+	const struct Words needles;
 	struct Batch *const batches;
 	_Atomic ssize_t remaining;
 };
 
 static void *worker_routine(void *ptr) {
 	struct Shared *shared = ptr;
-	struct Str needle = shared->needle;
+	const struct Words needles = shared->needles;
 
 	ssize_t batch_idx;
 	while ((batch_idx = --shared->remaining) >= 0) {
@@ -194,9 +223,16 @@ static void *worker_routine(void *ptr) {
 		unsigned n = 0;
 		for (unsigned i = 0; i < batch->len; ++i) {
 			struct Candidate x = batch->xs[i];
-			if (!is_match(needle.b, x.s.b, shared->ignore_case)) continue;
-			x.key = calc_cost(needle, x.s, shared->ignore_case);
+			for (size_t j = 0; j < needles.count; ++j) {
+				if (!is_match(needles.a[j].b, x.s.b, shared->ignore_case)) goto next_candidate;
+			}
+			int total_cost = 0;
+			for (size_t j = 0; j < needles.count; ++j) {
+				total_cost += calc_cost(needles.a[j], x.s, shared->ignore_case);
+			}
+			x.key = total_cost;
 			batch->xs[n++] = x;
+next_candidate:
 		}
 		batch->len = n;
 	}
@@ -244,7 +280,7 @@ static emacs_value hotfuzz_filter(emacs_env *env, ptrdiff_t nargs, emacs_value a
 	if (ignore_case) strtolower(needle);
 	struct Shared shared = {
 		.ignore_case = ignore_case,
-		.needle = needle,
+		.needles = strsplitwords( needle),
 		.batches = batches,
 		.remaining = batch_idx + 1,
 	};
